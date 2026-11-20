@@ -18,6 +18,10 @@ type ServerMetrics struct {
 	serverHandledHistogramEnabled bool
 	serverHandledHistogramOpts    prom.HistogramOpts
 	serverHandledHistogram        *prom.HistogramVec
+
+	// cardinalityGuard, when set, bounds the number of distinct
+	// grpc_service/grpc_method label pairs exported by every family above.
+	cardinalityGuard *CardinalityGuard
 }
 
 // NewServerMetrics returns a ServerMetrics object. Use a new instance of
@@ -70,8 +74,58 @@ func (m *ServerMetrics) EnableHandlingTimeHistogram(opts ...HistogramOption) {
 			m.serverHandledHistogramOpts,
 			[]string{"grpc_type", "grpc_service", "grpc_method"},
 		)
+		// Register the late-enabled histogram with the guard as well, so
+		// evicted methods cannot leak histogram child series.
+		if guard := m.cardinalityGuard; guard != nil {
+			histogram := m.serverHandledHistogram
+			guard.addFamily(func(rpcType grpcType, serviceName, methodName string) {
+				histogram.DeleteLabelValues(string(rpcType), serviceName, methodName)
+			})
+		}
 	}
 	m.serverHandledHistogramEnabled = true
+}
+
+// EnableCardinalityProtection bounds the number of distinct
+// grpc_service/grpc_method label pairs exported by all server-side metric
+// families. At most capacity methods are held simultaneously; RPCs for any
+// other method are reported under the "unknown" method label so that a
+// client inventing dynamic method suffixes can no longer create an
+// unbounded number of time series. A slot is reserved when an RPC starts
+// and only made permanent when it finishes, so cancelled requests give
+// their slot back; idle permanent slots are reclaimed least-recently-used
+// together with the underlying Prometheus child metrics, while slots owned
+// by in-flight RPCs are never evicted. A non-positive capacity leaves the
+// metrics unprotected.
+//
+// Call it before (or independently of) registering the metrics on a
+// Prometheus registry; existing ConstLabels and histogram bucket options
+// are unaffected.
+func (m *ServerMetrics) EnableCardinalityProtection(capacity int) {
+	guard := NewCardinalityGuard(capacity)
+	m.cardinalityGuard = guard
+	if capacity <= 0 {
+		// Disabled guard: Resolve/Commit/Release all pass through.
+		return
+	}
+	guard.addFamily(func(rpcType grpcType, serviceName, methodName string) {
+		m.serverStartedCounter.DeleteLabelValues(string(rpcType), serviceName, methodName)
+		m.serverStreamMsgReceived.DeleteLabelValues(string(rpcType), serviceName, methodName)
+		m.serverStreamMsgSent.DeleteLabelValues(string(rpcType), serviceName, methodName)
+		for _, code := range allCodes {
+			m.serverHandledCounter.DeleteLabelValues(string(rpcType), serviceName, methodName, code.String())
+		}
+		if m.serverHandledHistogramEnabled {
+			m.serverHandledHistogram.DeleteLabelValues(string(rpcType), serviceName, methodName)
+		}
+	})
+}
+
+// CardinalityGuard returns the guard backing cardinality protection, or nil
+// when protection is disabled. Its Stats/Reset/Close methods expose the
+// number of tracked labels, merges into unknown and evictions.
+func (m *ServerMetrics) CardinalityGuard() *CardinalityGuard {
+	return m.cardinalityGuard
 }
 
 // Describe sends the super-set of all possible descriptors of metrics
@@ -173,6 +227,17 @@ func (s *monitoredServerStream) RecvMsg(m interface{}) error {
 func preRegisterMethod(metrics *ServerMetrics, serviceName string, mInfo *grpc.MethodInfo) {
 	methodName := mInfo.Name
 	methodType := string(typeFromMethodInfo(mInfo))
+	guard := metrics.cardinalityGuard
+	if guard != nil {
+		// Registered service methods are known and finite: give them a
+		// permanent slot up front without evicting other methods. When the
+		// table is full, pre-register under unknown instead of creating new
+		// series. Pre-registration is not an RPC and does not count as a
+		// merge.
+		if !guard.TryCommit(typeFromMethodInfo(mInfo), serviceName, methodName) {
+			methodName = UnknownMethodLabel
+		}
+	}
 	// These are just references (no increments), as just referencing will create the labels but not set values.
 	metrics.serverStartedCounter.GetMetricWithLabelValues(methodType, serviceName, methodName)
 	metrics.serverStreamMsgReceived.GetMetricWithLabelValues(methodType, serviceName, methodName)

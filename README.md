@@ -170,6 +170,58 @@ grpc_server_handling_seconds_count{grpc_code="OK",grpc_method="PingList",grpc_se
 ```
 
 
+## Cardinality protection
+
+When a gRPC service fronts dynamic method names (for example a multi-tenant
+gateway that encodes tenant or route suffixes into `grpc_service`/`grpc_method`),
+a misbehaving or malicious client can force the interceptors to create an
+unbounded number of label sets and exhaust the Prometheus server's memory.
+
+`EnableCardinalityProtection(capacity)` bounds how many distinct method labels
+a `ServerMetrics` (or `ClientMetrics`) instance exports. Every metric family —
+started/handled counters, stream message counters and all enabled histograms —
+is guarded, so the total number of time series stays bounded:
+
+```go
+metrics := grpc_prometheus.NewServerMetrics()
+metrics.EnableCardinalityProtection(1000) // at most 1000 tracked method labels
+```
+
+Behaviour:
+
+* An RPC for a brand-new method reserves one of the `capacity` slots when it
+  starts and the slot becomes permanent when the RPC finishes. If every slot is
+  busy, the RPC is reported under the `unknown` `grpc_method` label instead, and
+  no new time series is created.
+* Cancelled RPCs give their reservation back, so a cancellation flood can never
+  reserve permanent capacity.
+* Idle permanent slots are reclaimed least-recently-used (LRU), and the
+  underlying Prometheus child metrics are deleted from every guarded family.
+  Slots owned by in-flight RPCs are never evicted.
+* Success/failure totals, stream send/receive counts, latency histograms and
+  status codes keep being recorded; RPCs folded into `unknown` remain visible in
+  aggregate through the `unknown` series.
+* `Reset()` clears only the protection state (allocation table and counters);
+  already registered Prometheus metrics are kept. `Close()` stops admission of
+  new labels while leaving existing slots intact.
+
+Protection state is observable through the guard returned by
+`CardinalityGuard()`:
+
+```go
+guard := metrics.CardinalityGuard()
+stats := guard.Stats() // Tracked, Merged (RPCs folded into unknown), Evicted
+guard.Reset()          // clear protection state without deleting metrics
+guard.Close()          // stop allocating new labels
+```
+
+`InitializeMetrics` honours the limit as well: declared gRPC methods are
+pre-registered without eviction, and methods beyond the capacity are
+pre-registered under `unknown`. With a non-positive capacity the guard is
+disabled and behaviour is identical to the unprotected interceptors, including
+existing `ConstLabels` and custom histogram buckets.
+
+
 ## Useful query examples
 
 Prometheus philosophy is to provide raw metrics to the monitoring system, and

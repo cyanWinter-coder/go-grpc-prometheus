@@ -29,6 +29,10 @@ type ClientMetrics struct {
 	clientStreamSendHistogramEnabled bool
 	clientStreamSendHistogramOpts    prom.HistogramOpts
 	clientStreamSendHistogram        *prom.HistogramVec
+
+	// cardinalityGuard, when set, bounds the number of distinct
+	// grpc_service/grpc_method label pairs exported by every family above.
+	cardinalityGuard *CardinalityGuard
 }
 
 // NewClientMetrics returns a ClientMetrics object. Use a new instance of
@@ -135,6 +139,12 @@ func (m *ClientMetrics) EnableClientHandlingTimeHistogram(opts ...HistogramOptio
 			m.clientHandledHistogramOpts,
 			[]string{"grpc_type", "grpc_service", "grpc_method"},
 		)
+		if guard := m.cardinalityGuard; guard != nil {
+			histogram := m.clientHandledHistogram
+			guard.addFamily(func(rpcType grpcType, serviceName, methodName string) {
+				histogram.DeleteLabelValues(string(rpcType), serviceName, methodName)
+			})
+		}
 	}
 	m.clientHandledHistogramEnabled = true
 }
@@ -151,6 +161,12 @@ func (m *ClientMetrics) EnableClientStreamReceiveTimeHistogram(opts ...Histogram
 			m.clientStreamRecvHistogramOpts,
 			[]string{"grpc_type", "grpc_service", "grpc_method"},
 		)
+		if guard := m.cardinalityGuard; guard != nil {
+			histogram := m.clientStreamRecvHistogram
+			guard.addFamily(func(rpcType grpcType, serviceName, methodName string) {
+				histogram.DeleteLabelValues(string(rpcType), serviceName, methodName)
+			})
+		}
 	}
 
 	m.clientStreamRecvHistogramEnabled = true
@@ -168,9 +184,61 @@ func (m *ClientMetrics) EnableClientStreamSendTimeHistogram(opts ...HistogramOpt
 			m.clientStreamSendHistogramOpts,
 			[]string{"grpc_type", "grpc_service", "grpc_method"},
 		)
+		if guard := m.cardinalityGuard; guard != nil {
+			histogram := m.clientStreamSendHistogram
+			guard.addFamily(func(rpcType grpcType, serviceName, methodName string) {
+				histogram.DeleteLabelValues(string(rpcType), serviceName, methodName)
+			})
+		}
 	}
 
 	m.clientStreamSendHistogramEnabled = true
+}
+
+// EnableCardinalityProtection bounds the number of distinct
+// grpc_service/grpc_method label pairs exported by all client-side metric
+// families. At most capacity methods are held simultaneously; RPCs for any
+// other method are reported under the "unknown" method label so that a
+// client calling dynamic method suffixes can no longer create an unbounded
+// number of time series. A slot is reserved when an RPC starts and only
+// made permanent when it finishes, so cancelled requests give their slot
+// back; idle permanent slots are reclaimed least-recently-used together
+// with the underlying Prometheus child metrics, while slots owned by
+// in-flight RPCs are never evicted. A non-positive capacity leaves the
+// metrics unprotected.
+//
+// Existing ConstLabels and histogram bucket options are unaffected.
+func (m *ClientMetrics) EnableCardinalityProtection(capacity int) {
+	guard := NewCardinalityGuard(capacity)
+	m.cardinalityGuard = guard
+	if capacity <= 0 {
+		// Disabled guard: Resolve/Commit/Release all pass through.
+		return
+	}
+	guard.addFamily(func(rpcType grpcType, serviceName, methodName string) {
+		m.clientStartedCounter.DeleteLabelValues(string(rpcType), serviceName, methodName)
+		m.clientStreamMsgReceived.DeleteLabelValues(string(rpcType), serviceName, methodName)
+		m.clientStreamMsgSent.DeleteLabelValues(string(rpcType), serviceName, methodName)
+		for _, code := range allCodes {
+			m.clientHandledCounter.DeleteLabelValues(string(rpcType), serviceName, methodName, code.String())
+		}
+		if m.clientHandledHistogramEnabled {
+			m.clientHandledHistogram.DeleteLabelValues(string(rpcType), serviceName, methodName)
+		}
+		if m.clientStreamRecvHistogramEnabled {
+			m.clientStreamRecvHistogram.DeleteLabelValues(string(rpcType), serviceName, methodName)
+		}
+		if m.clientStreamSendHistogramEnabled {
+			m.clientStreamSendHistogram.DeleteLabelValues(string(rpcType), serviceName, methodName)
+		}
+	})
+}
+
+// CardinalityGuard returns the guard backing cardinality protection, or nil
+// when protection is disabled. Its Stats/Reset/Close methods expose the
+// number of tracked labels, merges into unknown and evictions.
+func (m *ClientMetrics) CardinalityGuard() *CardinalityGuard {
+	return m.cardinalityGuard
 }
 
 // UnaryClientInterceptor is a gRPC client-side interceptor that provides Prometheus monitoring for Unary RPCs.

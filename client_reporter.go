@@ -15,7 +15,11 @@ type clientReporter struct {
 	rpcType     grpcType
 	serviceName string
 	methodName  string
-	startTime   time.Time
+	// reportedMethod is the grpc_method label value actually used on every
+	// metric family; it equals methodName unless cardinality protection
+	// folded the RPC into unknown.
+	reportedMethod string
+	startTime      time.Time
 }
 
 func newClientReporter(m *ClientMetrics, rpcType grpcType, fullMethod string) *clientReporter {
@@ -27,7 +31,11 @@ func newClientReporter(m *ClientMetrics, rpcType grpcType, fullMethod string) *c
 		r.startTime = time.Now()
 	}
 	r.serviceName, r.methodName = splitMethodName(fullMethod)
-	r.metrics.clientStartedCounter.WithLabelValues(string(r.rpcType), r.serviceName, r.methodName).Inc()
+	r.reportedMethod = r.methodName
+	if guard := r.metrics.cardinalityGuard; guard != nil {
+		r.reportedMethod = guard.Resolve(rpcType, r.serviceName, r.methodName)
+	}
+	r.metrics.clientStartedCounter.WithLabelValues(string(r.rpcType), r.serviceName, r.reportedMethod).Inc()
 	return r
 }
 
@@ -47,7 +55,7 @@ var emptyTimer = noOpTimer{}
 
 func (r *clientReporter) ReceiveMessageTimer() timer {
 	if r.metrics.clientStreamRecvHistogramEnabled {
-		hist := r.metrics.clientStreamRecvHistogram.WithLabelValues(string(r.rpcType), r.serviceName, r.methodName)
+		hist := r.metrics.clientStreamRecvHistogram.WithLabelValues(string(r.rpcType), r.serviceName, r.reportedMethod)
 		return prometheus.NewTimer(hist)
 	}
 
@@ -55,12 +63,12 @@ func (r *clientReporter) ReceiveMessageTimer() timer {
 }
 
 func (r *clientReporter) ReceivedMessage() {
-	r.metrics.clientStreamMsgReceived.WithLabelValues(string(r.rpcType), r.serviceName, r.methodName).Inc()
+	r.metrics.clientStreamMsgReceived.WithLabelValues(string(r.rpcType), r.serviceName, r.reportedMethod).Inc()
 }
 
 func (r *clientReporter) SendMessageTimer() timer {
 	if r.metrics.clientStreamSendHistogramEnabled {
-		hist := r.metrics.clientStreamSendHistogram.WithLabelValues(string(r.rpcType), r.serviceName, r.methodName)
+		hist := r.metrics.clientStreamSendHistogram.WithLabelValues(string(r.rpcType), r.serviceName, r.reportedMethod)
 		return prometheus.NewTimer(hist)
 	}
 
@@ -68,12 +76,23 @@ func (r *clientReporter) SendMessageTimer() timer {
 }
 
 func (r *clientReporter) SentMessage() {
-	r.metrics.clientStreamMsgSent.WithLabelValues(string(r.rpcType), r.serviceName, r.methodName).Inc()
+	r.metrics.clientStreamMsgSent.WithLabelValues(string(r.rpcType), r.serviceName, r.reportedMethod).Inc()
 }
 
 func (r *clientReporter) Handled(code codes.Code) {
-	r.metrics.clientHandledCounter.WithLabelValues(string(r.rpcType), r.serviceName, r.methodName, code.String()).Inc()
+	// Cancelled RPCs abandon their reservation instead of confirming it, so
+	// a flood of cancellations can never reserve permanent capacity ahead
+	// of real traffic. Every other outcome (success or failure) commits the
+	// slot; success/failure totals are recorded either way.
+	if guard := r.metrics.cardinalityGuard; guard != nil {
+		if code == codes.Canceled {
+			guard.Release(r.rpcType, r.serviceName, r.methodName)
+		} else {
+			guard.Commit(r.rpcType, r.serviceName, r.methodName)
+		}
+	}
+	r.metrics.clientHandledCounter.WithLabelValues(string(r.rpcType), r.serviceName, r.reportedMethod, code.String()).Inc()
 	if r.metrics.clientHandledHistogramEnabled {
-		r.metrics.clientHandledHistogram.WithLabelValues(string(r.rpcType), r.serviceName, r.methodName).Observe(time.Since(r.startTime).Seconds())
+		r.metrics.clientHandledHistogram.WithLabelValues(string(r.rpcType), r.serviceName, r.reportedMethod).Observe(time.Since(r.startTime).Seconds())
 	}
 }
